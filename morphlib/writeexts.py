@@ -174,7 +174,6 @@ class WriteExtension(cliapp.Application):
 
     def format_btrfs(self, raw_disk):
         try:
-	    self.status(msg='MW DEBUG: format_btrfs()')
             self.mkfs_btrfs(raw_disk)
         except BaseException:
             sys.stderr.write('Error creating disk image')
@@ -182,7 +181,6 @@ class WriteExtension(cliapp.Application):
 
     def format_zfs(self, raw_disk):
         try:
-	    self.status(msg='MW DEBUG: format_zfs()')
             self.mkfs_zfs(raw_disk)
         except BaseException:
             sys.stderr.write('Error creating disk image')
@@ -371,7 +369,6 @@ class WriteExtension(cliapp.Application):
         version_root = os.path.join(mountpoint, 'systems', version_label)
         state_root = os.path.join(mountpoint, 'state')
 
-        self.status(msg='MW DEBUG: helpme')
         os.makedirs(version_root)
         os.makedirs(state_root)
 
@@ -421,7 +418,6 @@ class WriteExtension(cliapp.Application):
         self.status(msg='Copying files to orig subvolume')
         cliapp.runcmd(['cp', '-a', temp_root + '/.',\
                         '/rasebock/orig/.'])
-	self.status(msg='Orig subvolume made MW DEBUG')
         #TODO: this feels bad to hardcode
 
     def create_run(self, version_root):
