@@ -153,6 +153,13 @@ class WriteExtension(cliapp.Application):
             self.format_btrfs(raw_disk)
             self.create_system(temp_root, raw_disk)
 
+    def create_local_system_zfs(self, temp_root, raw_disk):
+        '''Create a raw zfs system image locally.'''
+
+        with self.created_disk_image(raw_disk):
+            self.format_zfs(raw_disk)
+            self.create_system_zfs(temp_root, raw_disk)
+
     @contextlib.contextmanager
     def created_disk_image(self, location):
         size = self.get_disk_size()
@@ -167,10 +174,19 @@ class WriteExtension(cliapp.Application):
 
     def format_btrfs(self, raw_disk):
         try:
+	    self.status(msg='MW DEBUG: format_btrfs()')
             self.mkfs_btrfs(raw_disk)
         except BaseException:
             sys.stderr.write('Error creating disk image')
             raise
+
+    def format_zfs(self, raw_disk):
+        try:
+	    self.status(msg='MW DEBUG: format_zfs()')
+            self.mkfs_zfs(raw_disk)
+        except BaseException:
+            sys.stderr.write('Error creating disk image')
+	    raise
 
     def create_system(self, temp_root, raw_disk):
         with self.mount(raw_disk) as mp:
@@ -180,6 +196,16 @@ class WriteExtension(cliapp.Application):
                     disk_uuid=self.get_uuid(raw_disk))
             except BaseException, e:
                 sys.stderr.write('Error creating Btrfs system layout')
+                raise
+
+    def create_system_zfs(self, temp_root, raw_disk):
+        with self.mount_zfs(raw_disk) as mp:
+	    try:
+                self.create_zfs_system_layout(
+                    temp_root, mp, version_label='factory',
+                    disk_uuid=None)
+            except BaseException, e:
+                sys.stderr.write('Error creating Zfs system layout')
                 raise
 
     def _parse_size(self, size):
@@ -240,6 +266,19 @@ class WriteExtension(cliapp.Application):
         self.status(msg='Creating btrfs filesystem')
         cliapp.runcmd(['mkfs.btrfs', '-f', '-L', 'baserock', location])
 
+    def mkfs_zfs(self, location):
+        '''Create a zfs filesystem on the disk.'''
+        self.status(msg='Creating zfs filesystem')
+	disk_size_mb = self.get_disk_size()/1048576 # TODO: magical!
+        cliapp.runcmd(['dd', 'if=/dev/zero', 'of='+location, 'bs=1M',\
+                        'count='+str(disk_size_mb)])  
+        # TODO: make this count relevant to the requested filesize
+        cliapp.runcmd(['zpool', 'create', '-o', 'ashift=12',\
+                        'rasebock',\
+                        '/src/workspace/my-new-system/baserock/baserock/definitions/'+location])  
+        # TODO: make location and 'rasebock' unhardcoded
+        # TODO: Destroy rasebock if it exists?
+
     def get_uuid(self, location):
         '''Get the UUID of a block device's file system.'''
         # Requires util-linux blkid; busybox one ignores options and
@@ -266,6 +305,23 @@ class WriteExtension(cliapp.Application):
             self.status(msg='Unmounting filesystem')
             cliapp.runcmd(['umount', mount_point])
             os.rmdir(mount_point)
+
+    @contextlib.contextmanager
+    def mount_zfs(self, location):
+        self.status(msg='Mounting zfs filesystem')
+        try:
+            mount_point = tempfile.mkdtemp()
+#            cliapp.runcmd(['zfs', 'mount', location])
+        except BaseException, e:
+            sys.stderr.write('Error mounting filesystem')
+            os.rmdir(mount_point)
+            raise
+        try:
+            yield mount_point
+        finally:
+            self.status(msg='Unmounting filesystem')
+#            cliapp.runcmd(['umount', mount_point])
+#            os.rmdir(mount_point)
 
     def create_btrfs_system_layout(self, temp_root, mountpoint, version_label,
                                    disk_uuid):
@@ -305,6 +361,46 @@ class WriteExtension(cliapp.Application):
                 self.generate_bootloader_config(mountpoint)
             self.install_bootloader(mountpoint)
 
+
+    def create_zfs_system_layout(self, temp_root, mountpoint, version_label,
+                                   disk_uuid):
+        '''Separate base OS versions from state using subvolumes.
+
+        '''
+        initramfs = self.find_initramfs(temp_root)
+        version_root = os.path.join(mountpoint, 'systems', version_label)
+        state_root = os.path.join(mountpoint, 'state')
+
+        self.status(msg='MW DEBUG: helpme')
+        os.makedirs(version_root)
+        os.makedirs(state_root)
+
+        self.create_orig_zfs(version_root, temp_root)
+        system_dir = os.path.join(version_root, 'orig')
+
+        state_dirs = self.complete_fstab_for_zfs_layout(system_dir,
+                                                          disk_uuid)
+
+        for state_dir in state_dirs:
+            self.create_state_subvolume_zfs(system_dir, mountpoint, state_dir)
+
+        self.create_run_zfs(version_root)
+
+        os.symlink(
+                version_label, os.path.join(mountpoint, 'systems', 'default'))
+
+        if self.bootloader_config_is_wanted():
+            self.install_kernel(version_root, temp_root)
+            if self.get_dtb_path() != '':
+                self.install_dtb(version_root, temp_root)
+            self.install_syslinux_menu(mountpoint, version_root)
+            if initramfs is not None:
+                self.install_initramfs(initramfs, version_root)
+                self.generate_bootloader_config(mountpoint, disk_uuid)
+            else:
+                self.generate_bootloader_config(mountpoint)
+            self.install_bootloader(mountpoint)
+
     def create_orig(self, version_root, temp_root):
         '''Create the default "factory" system.'''
 
@@ -315,6 +411,19 @@ class WriteExtension(cliapp.Application):
         self.status(msg='Copying files to orig subvolume')
         cliapp.runcmd(['cp', '-a', temp_root + '/.', orig + '/.'])
 
+    def create_orig_zfs(self, version_root, temp_root):
+        '''Create the default "factory" system for zfs.'''
+
+        orig = os.path.join(version_root, 'orig')
+
+        self.status(msg='Creating orig subvolume')
+        cliapp.runcmd(['zfs', 'create', 'rasebock/orig'])
+        self.status(msg='Copying files to orig subvolume')
+        cliapp.runcmd(['cp', '-a', temp_root + '/.',\
+                        '/rasebock/orig/.'])
+	self.status(msg='Orig subvolume made MW DEBUG')
+        #TODO: this feels bad to hardcode
+
     def create_run(self, version_root):
         '''Create the 'run' snapshot.'''
 
@@ -323,6 +432,16 @@ class WriteExtension(cliapp.Application):
         run = os.path.join(version_root, 'run')
         cliapp.runcmd(
             ['btrfs', 'subvolume', 'snapshot', orig, run])
+
+    def create_run_zfs(self, version_root):
+        '''Create the 'run' snapshot using zfs.'''
+
+        self.status(msg='Creating run subvolume')
+        orig = os.path.join(version_root, 'orig')
+        run = os.path.join(version_root, 'run')
+        cliapp.runcmd(['zfs', 'snapshot', 'rasebock/orig@snapshot1'])
+        cliapp.runcmd(['zfs', 'clone', 'rasebock/orig@snapshot1',\
+                        'rasebock/run'])
 
     def create_state_subvolume(self, system_dir, mountpoint, state_subdir):
         '''Create a shared state subvolume.
@@ -347,6 +466,30 @@ class WriteExtension(cliapp.Application):
         for filename in files:
             filepath = os.path.join(existing_state_dir, filename)
             cliapp.runcmd(['mv', filepath, subvolume])
+
+    def create_state_subvolume_zfs(self, system_dir, mountpoint, state_subdir):
+        '''Create a shared state subvolume for zfs.
+
+        We need to move any files added to the temporary rootfs by the
+        configure extensions to their correct home. For example, they might
+        have added keys in `/root/.ssh` which we now need to transfer to
+        `/state/root/.ssh`.
+
+        '''
+        self.status(msg='Creating %s subvolume' % state_subdir)
+        subvolume = os.path.join(mountpoint, 'state', state_subdir)
+        cliapp.runcmd(['zfs', 'create', 'rasebock/'+state_subdir])
+        os.chmod('/rasebock/'+state_subdir, 0755)
+
+        existing_state_dir = os.path.join(system_dir, state_subdir)
+        files = []
+        if os.path.exists(existing_state_dir):
+            files = os.listdir(existing_state_dir)
+        if len(files) > 0:
+            self.status(msg='Moving existing data to %s subvolume' % subvolume)
+        for filename in files:
+            filepath = os.path.join(existing_state_dir, filename)
+            cliapp.runcmd(['mv', filepath, 'rasebock/'+state_subdir])
 
     def complete_fstab_for_btrfs_layout(self, system_dir, rootfs_uuid=None):
         '''Fill in /etc/fstab entries for the default Btrfs disk layout.
@@ -384,6 +527,43 @@ class WriteExtension(cliapp.Application):
                 fstab.add_line(
                         '%s  /%s  btrfs subvol=%s,defaults,rw,noatime 0 2' %
                         (root_device, state_dir, state_subvol))
+
+        fstab.write()
+        return state_dirs_to_create
+
+    def complete_fstab_for_zfs_layout(self, system_dir, rootfs_uuid=None):
+        '''Fill in /etc/fstab entries for the default Zfs disk layout.
+
+        In the future we should move this code out of the write extension and
+        in to a configure extension. To do that, though, we need some way of
+        informing the configure extension what layout should be used. Right now
+        a configure extension doesn't know if the system is going to end up as
+        a Btrfs disk image, a tarfile or something else and so it can't come
+        up with a sensible default fstab.
+
+        Configuration extensions can already create any /etc/fstab that they
+        like. This function only fills in entries that are missing, so if for
+        example the user configured /home to be on a separate partition, that
+        decision will be honoured and /state/home will not be created.
+
+        '''
+        shared_state_dirs = {'home', 'root', 'opt', 'srv', 'var'}
+
+        fstab = Fstab(os.path.join('/rasebock', 'orig', 'etc', 'fstab'))
+        # TODO: Feels bad to hardcode rasebock
+        existing_mounts = fstab.get_mounts()
+
+        if '/' in existing_mounts:
+            root_device = existing_mounts['/']
+        else:
+            root_device = (self.get_root_device() if rootfs_uuid is None else
+                           'UUID=%s' % rootfs_uuid)
+            fstab.add_line('%s  / zfs defaults,rw,noatime 0 1' % root_device)
+
+        state_dirs_to_create = set()
+        for state_dir in shared_state_dirs:
+            if '/' + state_dir not in existing_mounts:
+                state_dirs_to_create.add(state_dir)
 
         fstab.write()
         return state_dirs_to_create
